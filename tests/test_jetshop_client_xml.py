@@ -364,4 +364,4 @@ def test_product_add_update_images_builds_body(monkeypatch):
     assert "<Product_AddUpdateImages" in captured["body"]
     assert "<ArticleNumber>Pelle-3447-10</ArticleNumber>" in captured["body"]
     assert "<Reload>true</Reload>" in captured["body"]
-    assert "<divider>.</divider>" in captured["body"]
+    assert "<divider>_</divider>" in captured["body"]

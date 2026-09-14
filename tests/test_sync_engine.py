@@ -85,9 +85,10 @@ def _ensure_b2c_mp_true(product):
 
 
 class StubJetshopClient:
-    def __init__(self, raise_on_get=False, dyn_failures=None):
+    def __init__(self, raise_on_get=False, dyn_failures=None, raise_on_price=False):
         self.raise_on_get = raise_on_get
         self.dyn_failures = dyn_failures or []
+        self.raise_on_price = raise_on_price
         self.add_update_calls = 0
         self.dyn_save_calls = 0
         self.dyn_inputs = []
@@ -95,9 +96,11 @@ class StubJetshopClient:
         self.delete_article_numbers = []
         self.image_uploads = []
         self.image_link_calls = 0
+        self.image_link_dividers = []
         self.price_list_calls = 0
         self.price_list_inputs = []
         self.add_update_payloads = []
+        self.operation_order = []
 
     def product_get(self, culture, article_number):
         if self.raise_on_get:
@@ -110,28 +113,37 @@ class StubJetshopClient:
         return {}
 
     def product_add_update(self, product_data_list):
+        self.operation_order.append("product_add_update")
         self.add_update_calls += 1
         self.add_update_payloads.append(product_data_list)
         return []
 
     def dyn_save(self, inputs):
+        self.operation_order.append("dyn_save")
         self.dyn_save_calls += 1
         self.dyn_inputs.append(inputs)
         return self.dyn_failures
 
     def price_list_update(self, inputs):
+        self.operation_order.append("price_list_update")
         self.price_list_calls += 1
         self.price_list_inputs = inputs
+        if self.raise_on_price:
+            raise RuntimeError("price failed")
 
     def product_delete(self, article_number):
         self.delete_calls += 1
         self.delete_article_numbers.append(article_number)
 
     def upload_image(self, base64_code, file_name, image_name):
+        self.operation_order.append("upload_image")
         self.image_uploads.append((base64_code, file_name, image_name))
 
-    def product_add_update_images(self, article_numbers):
+    def product_add_update_images(self, article_numbers, divider="_"):
+        self.operation_order.append("image_link")
         self.image_link_calls += 1
+        self.image_link_dividers.append(divider)
+        return []
 
 
 def test_sync_engine_dry_run_writes_diff(tmp_path, monkeypatch):
@@ -155,6 +167,7 @@ def test_sync_engine_dry_run_writes_diff(tmp_path, monkeypatch):
     assert jetshop_client.add_update_calls == 0
     assert jetshop_client.dyn_save_calls == 0
     assert jetshop_client.price_list_calls == 0
+    assert state_store.read_last_run() is None
 
 
 def test_sync_engine_handles_read_failure(tmp_path, monkeypatch):
@@ -474,7 +487,203 @@ def test_sync_engine_uploads_images(tmp_path, monkeypatch):
 
     assert report["counts"]["failed"] == 0
     assert jetshop_client.image_uploads
+    assert jetshop_client.image_uploads[0][1] == "Pelle-1092-10_3.jpg"
+    assert jetshop_client.image_uploads[0][2] == "Pelle-1092-10_3.jpg"
     assert jetshop_client.image_link_calls == 1
+    assert jetshop_client.image_link_dividers == ["_"]
+
+
+def test_sync_engine_prefers_feed_sorting_field_for_image_name(tmp_path, monkeypatch):
+    mapping_path = Path(__file__).resolve().parents[1] / "mappings" / "mapping.yaml"
+    mapping = load_mapping(mapping_path)
+
+    product = build_sample_product()
+    product["media"] = [
+        {
+            "action": "CREATE",
+            "mediaCode": "7785",
+            "mediaType": "IMAGE",
+            "fileName": "Pelle-3447-99.jpg",
+            "sortNo": 9,
+            "sorting": 2,
+        }
+    ]
+
+    feed_client = StubFeedClient([product])
+    jetshop_client = StubJetshopClient()
+    logger = logging.getLogger("test_sync_engine_images_sorting")
+    logger.addHandler(logging.NullHandler())
+    state_store = StateStore(tmp_path / "state" / "last_run.json")
+
+    monkeypatch.chdir(tmp_path)
+
+    engine = SyncEngine(feed_client, jetshop_client, mapping, logger, state_store)
+    report = engine.sync("2025-01-01T00:00:00Z", "Pelle-1092-10", None, False)
+
+    assert report["counts"]["failed"] == 0
+    assert jetshop_client.image_uploads[0][1] == "Pelle-1092-10_2.jpg"
+
+
+def test_sync_engine_uses_full_product_for_single_item_mapping_and_images(tmp_path, monkeypatch):
+    mapping_path = Path(__file__).resolve().parents[1] / "mappings" / "mapping.yaml"
+    mapping = load_mapping(mapping_path)
+
+    partial_product = {
+        "identifier": {"productNo": "Pelle-1092-10"},
+        "attributes": [{"importCode": "monitor_disp", "dataType": "FLOAT", "value": 10.0}],
+        "texts": [{"importCode": "name_1", "value": {"sv": "Nigella"}}],
+        "media": [{"mediaCode": "7785", "mediaType": "IMAGE", "fileName": "changed.jpg", "sortNo": 1}],
+    }
+    full_product = build_sample_product()
+    full_product["media"] = [
+        {
+            "mediaCode": "7786",
+            "mediaType": "IMAGE",
+            "fileName": "snitt-1092-10c.jpg",
+            "sortNo": 2,
+        },
+        {
+            "mediaCode": "7785",
+            "mediaType": "IMAGE",
+            "fileName": "1092-10.jpg",
+            "sortNo": 1,
+        },
+    ]
+
+    feed_client = StubFeedClient([partial_product], full_products=[_ensure_b2c_mp_true(full_product)])
+    jetshop_client = StubJetshopClient()
+    logger = logging.getLogger("test_sync_engine_full_product_mapping")
+    logger.addHandler(logging.NullHandler())
+    state_store = StateStore(tmp_path / "state" / "last_run.json")
+
+    monkeypatch.chdir(tmp_path)
+
+    engine = SyncEngine(feed_client, jetshop_client, mapping, logger, state_store)
+    report = engine.sync("2025-01-01T00:00:00Z", "Pelle-1092-10", None, False)
+
+    assert report["counts"]["failed"] == 0
+    update_payload = jetshop_client.add_update_payloads[0][0]
+    assert update_payload["ProductDescription"] == "L1<br>L2"
+    assert update_payload["EanCode"] == "123"
+    assert update_payload["ProductInCategories"]
+    assert jetshop_client.price_list_inputs
+    assert [item[1] for item in jetshop_client.image_uploads] == [
+        "Pelle-1092-10_1.jpg",
+        "Pelle-1092-10_2.jpg",
+    ]
+
+
+def test_sync_engine_syncs_images_before_price_list_failure(tmp_path, monkeypatch):
+    mapping_path = Path(__file__).resolve().parents[1] / "mappings" / "mapping.yaml"
+    mapping = load_mapping(mapping_path)
+
+    product = build_sample_product()
+    product["media"] = [
+        {
+            "action": "CREATE",
+            "mediaCode": "7785",
+            "mediaType": "IMAGE",
+            "fileName": "Pelle-3447-10.jpg",
+            "sortNo": 3,
+        }
+    ]
+
+    feed_client = StubFeedClient([product])
+    jetshop_client = StubJetshopClient(raise_on_price=True)
+    logger = logging.getLogger("test_sync_engine_images_before_price_failure")
+    logger.addHandler(logging.NullHandler())
+    state_store = StateStore(tmp_path / "state" / "last_run.json")
+
+    monkeypatch.chdir(tmp_path)
+
+    engine = SyncEngine(feed_client, jetshop_client, mapping, logger, state_store)
+    report = engine.sync("2025-01-01T00:00:00Z", "Pelle-1092-10", None, False)
+
+    assert report["counts"]["failed"] == 1
+    assert jetshop_client.image_uploads[0][1] == "Pelle-1092-10_3.jpg"
+    assert jetshop_client.image_link_calls == 1
+    assert jetshop_client.operation_order.index("image_link") < jetshop_client.operation_order.index("price_list_update")
+
+
+def test_sync_engine_single_item_falls_back_to_full_product_when_no_changes(tmp_path, monkeypatch):
+    mapping_path = Path(__file__).resolve().parents[1] / "mappings" / "mapping.yaml"
+    mapping = load_mapping(mapping_path)
+
+    full_product = _ensure_b2c_mp_true(build_sample_product())
+    feed_client = StubFeedClient([], full_products=[full_product])
+    jetshop_client = StubJetshopClient()
+    logger = logging.getLogger("test_sync_engine_single_item_full_fallback")
+    logger.addHandler(logging.NullHandler())
+    state_store = StateStore(tmp_path / "state" / "last_run.json")
+
+    monkeypatch.chdir(tmp_path)
+
+    engine = SyncEngine(feed_client, jetshop_client, mapping, logger, state_store)
+    report = engine.sync("2025-01-01T00:00:00Z", "Pelle-1092-10", None, False)
+
+    assert report["counts"]["processed"] == 1
+    assert report["counts"]["failed"] == 0
+    assert jetshop_client.add_update_calls == 1
+
+
+def test_sync_engine_reloads_images_when_feed_image_deleted(tmp_path, monkeypatch):
+    mapping_path = Path(__file__).resolve().parents[1] / "mappings" / "mapping.yaml"
+    mapping = load_mapping(mapping_path)
+
+    partial_product = build_sample_product()
+    partial_product["media"] = [
+        {
+            "action": "DELETE",
+            "mediaCode": "7785",
+            "mediaType": "IMAGE",
+            "fileName": "old.jpg",
+            "sortNo": 1,
+        }
+    ]
+    full_product = build_sample_product()
+    full_product["media"] = []
+
+    feed_client = StubFeedClient([partial_product], full_products=[_ensure_b2c_mp_true(full_product)])
+    jetshop_client = StubJetshopClient()
+    logger = logging.getLogger("test_sync_engine_image_delete")
+    logger.addHandler(logging.NullHandler())
+    state_store = StateStore(tmp_path / "state" / "last_run.json")
+
+    monkeypatch.chdir(tmp_path)
+
+    engine = SyncEngine(feed_client, jetshop_client, mapping, logger, state_store)
+    report = engine.sync("2025-01-01T00:00:00Z", None, None, False)
+
+    assert report["counts"]["failed"] == 0
+    assert jetshop_client.image_uploads == []
+    assert jetshop_client.image_link_calls == 1
+    assert jetshop_client.image_link_dividers == ["_"]
+
+
+def test_sync_engine_preserves_delivery_date_when_feed_value_missing(tmp_path, monkeypatch):
+    mapping_path = Path(__file__).resolve().parents[1] / "mappings" / "mapping.yaml"
+    mapping = load_mapping(mapping_path)
+
+    product = build_sample_product()
+    product["attributes"] = [
+        attr for attr in product["attributes"] if attr["importCode"] != "monitor_deliverydate"
+    ]
+    product["attributes"].append({"importCode": "monitor_deliverydate", "dataType": "UNI_TEXT"})
+
+    feed_client = StubFeedClient([product])
+    jetshop_client = StubJetshopClient()
+    logger = logging.getLogger("test_sync_engine_preserve_delivery_date")
+    logger.addHandler(logging.NullHandler())
+    state_store = StateStore(tmp_path / "state" / "last_run.json")
+
+    monkeypatch.chdir(tmp_path)
+
+    engine = SyncEngine(feed_client, jetshop_client, mapping, logger, state_store)
+    report = engine.sync("2025-01-01T00:00:00Z", "Pelle-1092-10", None, False)
+
+    assert report["counts"]["failed"] == 0
+    payload = jetshop_client.add_update_payloads[0][0]
+    assert "DeliveryDate" not in payload.get("StockData", {})
 
 
 def test_sync_engine_missing_show_flag_hides_product(tmp_path, monkeypatch):

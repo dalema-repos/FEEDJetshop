@@ -1,0 +1,200 @@
+version: 1
+cultures:
+  - sv-SE
+  - nb-NO
+fallbacks:
+  nb-NO: sv-SE
+culture_map:
+  sv-SE: sv
+  nb-NO: nb
+
+product_fields:
+  - target: ArticleNumber
+    source: identifier.productNo
+    type: string
+    coerce: strict
+
+  - target: Name
+    source: texts[name_1].value
+    type: string
+    cultures: [sv-SE, nb-NO]
+    fallback: sv-SE
+    validations:
+      max_length: 200
+    optional: true
+
+  - target: SubName
+    source: texts[name_2].value
+    type: string
+    cultures: [sv-SE, nb-NO]
+    fallback: sv-SE
+    validations:
+      max_length: 200
+    optional: true
+
+  - target: ShortDescription
+    source: texts[productinfoshort].value
+    type: string
+    cultures: [sv-SE, nb-NO]
+    fallback: sv-SE
+    validations:
+      max_length: 300
+    optional: true
+
+  - target: ProductDescription
+    source: texts[productinfolong].value
+    type: string
+    cultures: [sv-SE, nb-NO]
+    fallback: sv-SE
+    transforms:
+      - name: newline_to_br
+    validations:
+      max_length: 2000
+    optional: true
+
+  - target: EanCode
+    source: attributes[monitor_GTIN].value
+    type: string
+    coerce: strict
+    optional: true
+
+stock_fields:
+  - target: NewStockCount
+    source: attributes[monitor_disp].value
+    type: int
+    coerce: coerce
+    optional: true
+
+  - target: DeliveryDate
+    source: attributes[monitor_deliverydate].value
+    type: datetime
+    coerce: coerce
+    optional: true
+    preserve_if_missing: true
+
+category_fields:
+  source: attributes[jetshop_category_mp].value
+  type: list
+  item_type: string
+  coerce: strict
+  strategy: replace
+  optional: true
+
+dynamic_fields_auto_map:
+  enabled: true
+  coerce: coerce
+  type: string
+  join_delimiter: ", "
+  skip_range: true
+  allowed_keys:
+    - atr_height
+    - atr_dia
+    - size
+    - b2c_mp
+    - atr_colour
+    - atr_grouping
+    - atr_length
+    - spec_cat
+    - spec_subcat
+    - tab-data-youtube
+    - atr_kdiao
+    - atr_kdian
+    - atr_kheight
+    - list_bundle
+
+dynamic_fields_allowlist:
+  - key: atr_height
+    source: attributes[atr_height].value
+    type: string
+    coerce: coerce
+    cultures: [sv-SE, nb-NO]
+    optional: true
+
+  - key: atr_colour
+    source: attributes[atr_colour]
+    type: string
+    coerce: strict
+    cultures: [sv-SE, nb-NO]
+    transforms:
+      - name: data_register_label
+        args:
+          join_delimiter: ", "
+    optional: true
+
+  - key: atr_grouping
+    source: attributes[atr_grouping].value
+    type: string
+    coerce: strict
+    cultures: [sv-SE, nb-NO]
+    optional: true
+
+  - key: atr_length
+    source: attributes[atr_length].value
+    type: string
+    coerce: coerce
+    cultures: [sv-SE, nb-NO]
+    optional: true
+
+  - key: atr_kheight
+    source: attributes[atr_kheight].value
+    type: string
+    coerce: coerce
+    cultures: [sv-SE, nb-NO]
+    optional: true
+
+  - key: atr_kdiao
+    source: attributes[atr_kdiao].value
+    type: string
+    coerce: coerce
+    cultures: [sv-SE, nb-NO]
+    optional: true
+
+  - key: atr_kdian
+    source: attributes[atr_kdian].value
+    type: string
+    coerce: coerce
+    cultures: [sv-SE, nb-NO]
+    optional: true
+
+  - key: spec_cat
+    source: attributes[spec_cat].value
+    type: string
+    coerce: strict
+    cultures: [sv-SE, nb-NO]
+    fallback: sv-SE
+    optional: true
+
+  - key: spec_subcat
+    source: attributes[spec_subcat].value
+    type: string
+    coerce: strict
+    cultures: [sv-SE, nb-NO]
+    fallback: sv-SE
+    optional: true
+
+price_lists:
+  - name: ledlenser_test_no_default
+    price_list_id: F2A1A7AB-B178-4813-9924-23400C75C180
+    price_source: attributes[b2c_price_se].value
+    discounted_price_source: attributes[b2c_disc_price_mp_se].value
+    discount_period_source: attributes[b2c_disc_bo_se].value
+    hide_product_source: attributes[se_show_mp].value
+    clear_price_on_missing: true
+    clear_price_value: -1
+    clear_discount_on_missing: true
+    type: int
+    coerce: coerce
+    optional: true
+
+  - name: ledlenser_test_se
+    price_list_id: C8963096-F9EA-493F-A638-6BB63B49602E
+    price_source: attributes[b2c_price_se].value
+    discounted_price_source: attributes[b2c_disc_price_mp_se].value
+    discount_period_source: attributes[b2c_disc_bo_se].value
+    hide_product_source: attributes[se_show_mp].value
+    clear_price_on_missing: true
+    clear_price_value: -1
+    clear_discount_on_missing: true
+    type: int
+    coerce: coerce
+    optional: true

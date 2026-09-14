@@ -49,6 +49,13 @@ class DynamicFieldResult:
     message: str
 
 
+@dataclass
+class ImageLinkResult:
+    identifier: str
+    result_type: str
+    success: bool
+
+
 class JetshopClient:
     def __init__(self, config: Config, logger) -> None:
         self.config = config
@@ -84,6 +91,7 @@ class JetshopClient:
             "EanCode": _text_any_ns(product_data, "EanCode"),
             "ProductInCategories": _parse_categories(product_data),
             "StockData": _parse_stock(product_data),
+            "Images": _parse_images(product_data),
         }
         self.logger.debug(
             "jetshop_categories_current",
@@ -217,7 +225,9 @@ class JetshopClient:
 """.strip()
         self._post_soap(body, "UploadImage")
 
-    def product_add_update_images(self, article_numbers: List[str]) -> None:
+    def product_add_update_images(
+        self, article_numbers: List[str], divider: str = "_"
+    ) -> List[ImageLinkResult]:
         items_xml = "\n".join(
             [
                 f"<ArticleNumberImages><ArticleNumber>{escape_xml(num)}</ArticleNumber><Reload>true</Reload></ArticleNumberImages>"
@@ -229,10 +239,24 @@ class JetshopClient:
   <articleNumbers>
     {items_xml}
   </articleNumbers>
-  <divider>.</divider>
+  <divider>{escape_xml(divider)}</divider>
 </Product_AddUpdateImages>
 """.strip()
-        self._post_soap(body, "Product_AddUpdateImages")
+        response_xml = self._post_soap(body, "Product_AddUpdateImages")
+        root = ET.fromstring(response_xml)
+        success_types = {"Success", "SuccessNew", "SuccessUpdate", "NoNewImages", "NoAnyImages"}
+        results: List[ImageLinkResult] = []
+        for item in root.findall(".//ws:ResultMessage", NS):
+            identifier = _text(item, "Identifier") or ""
+            result_type = _text(item, "ResultType") or ""
+            results.append(
+                ImageLinkResult(
+                    identifier=identifier,
+                    result_type=result_type,
+                    success=result_type in success_types,
+                )
+            )
+        return results
 
     def _post_soap(self, body_xml: str, operation: str) -> str:
         envelope = _build_envelope(body_xml, self.header_xml)
@@ -376,6 +400,32 @@ def _parse_stock(product_data: ET.Element) -> Dict[str, Any]:
         "UseAdvancedStatus": _parse_bool(_text(stock_node, "UseAdvancedStatus")),
         "StockStatusWhenOutOfStock": _parse_int(_text(stock_node, "StockStatusWhenOutOfStock")),
     }
+
+
+def _parse_images(product_data: ET.Element) -> List[Dict[str, Any]]:
+    images_xml = _text_any_ns(product_data, "ImagesXml")
+    if not images_xml:
+        return []
+    try:
+        root = ET.fromstring(images_xml)
+    except ET.ParseError:
+        return []
+
+    images: List[Dict[str, Any]] = []
+    for item in root.findall(".//I"):
+        file_name = item.get("i") or ""
+        if "?" in file_name:
+            file_name = file_name.split("?", 1)[0]
+        sort_order = _parse_int(item.get("so"))
+        images.append(
+            {
+                "FileName": file_name,
+                "AltText": item.get("alt"),
+                "Title": item.get("title"),
+                "SortOrder": sort_order,
+            }
+        )
+    return images
 
 
 def _find_text_any_ns(parent: ET.Element, tag_suffix: str) -> Optional[str]:

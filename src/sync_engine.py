@@ -60,6 +60,12 @@ class SyncEngine:
         started_time = datetime.now(timezone.utc)
         started_at = started_time.isoformat()
         products = self.feed_client.fetch_products(export_from, product_no, limit)
+        full_product_cache: Dict[str, Dict[str, Any]] = {}
+        if product_no and not products:
+            full_product = self.feed_client.fetch_product_full(product_no)
+            if full_product:
+                products = [full_product]
+                full_product_cache[product_no] = full_product
 
         results: List[ProductProcessResult] = []
         counts = {"processed": 0, "updated": 0, "deleted": 0, "skipped": 0, "failed": 0, "no_change": 0}
@@ -84,7 +90,10 @@ class SyncEngine:
                     counts["failed"] += 1
                 continue
 
-            skip_result = self._maybe_skip_due_to_b2c_mp(product_no_value)
+            full_product, skip_result = self._load_full_product_for_sync(
+                product_no_value,
+                full_product_cache.get(product_no_value),
+            )
             if skip_result is not None:
                 results.append(skip_result)
                 if skip_result.success:
@@ -92,10 +101,24 @@ class SyncEngine:
                 else:
                     counts["failed"] += 1
                 continue
+            if full_product is None:
+                results.append(
+                    ProductProcessResult(
+                        product_no_value,
+                        "skip",
+                        False,
+                        ["Full product not found in FEED"],
+                        0,
+                        0,
+                    )
+                )
+                counts["failed"] += 1
+                continue
 
-            self._log_unmapped(product, product_no_value)
+            self._log_unmapped(full_product, product_no_value)
 
-            result = self._handle_update(product, product_no_value, dry_run)
+            sync_images = product_no is not None or _has_image_changes(product)
+            result = self._handle_update(full_product, product_no_value, dry_run, sync_images)
             results.append(result)
             if not result.success:
                 counts["failed"] += 1
@@ -117,7 +140,7 @@ class SyncEngine:
             "counts": counts,
             "products": [result.__dict__ for result in results],
         }
-        if counts["failed"] == 0:
+        if counts["failed"] == 0 and not dry_run:
             self.state_store.write_now()
 
         updated_products: List[str] = []
@@ -221,27 +244,32 @@ class SyncEngine:
             )
             return ProductProcessResult(product_no, "delete", False, [str(exc)], 0, 0)
 
-    def _maybe_skip_due_to_b2c_mp(self, product_no: str) -> Optional[ProductProcessResult]:
-        try:
-            full_product = self.feed_client.fetch_product_full(product_no)
-        except Exception as exc:
-            self.logger.error(
-                "feed_full_fetch_failed",
-                extra={
-                    "event": "feed_full_fetch_failed",
-                    "productNo": product_no,
-                    "success": False,
-                    "detail": str(exc),
-                },
-            )
-            return ProductProcessResult(product_no, "skip", False, [str(exc)], 0, 0)
+    def _load_full_product_for_sync(
+        self,
+        product_no: str,
+        full_product: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[ProductProcessResult]]:
+        if full_product is None:
+            try:
+                full_product = self.feed_client.fetch_product_full(product_no)
+            except Exception as exc:
+                self.logger.error(
+                    "feed_full_fetch_failed",
+                    extra={
+                        "event": "feed_full_fetch_failed",
+                        "productNo": product_no,
+                        "success": False,
+                        "detail": str(exc),
+                    },
+                )
+                return None, ProductProcessResult(product_no, "skip", False, [str(exc)], 0, 0)
 
         if not full_product:
             self.logger.warning(
                 "feed_full_missing",
                 extra={"event": "feed_full_missing", "productNo": product_no},
             )
-            return ProductProcessResult(
+            return None, ProductProcessResult(
                 product_no,
                 "skip",
                 False,
@@ -257,11 +285,11 @@ class SyncEngine:
         )
         if b2c_attr is None:
             self._log_b2c_skip(product_no, "missing_attribute", None)
-            return ProductProcessResult(product_no, "skip", True, [], 0, 0)
+            return full_product, ProductProcessResult(product_no, "skip", True, [], 0, 0)
 
         if "value" not in b2c_attr:
             self._log_b2c_skip(product_no, "missing_value", None)
-            return ProductProcessResult(product_no, "skip", True, [], 0, 0)
+            return full_product, ProductProcessResult(product_no, "skip", True, [], 0, 0)
 
         raw_value = b2c_attr.get("value")
         if isinstance(raw_value, dict):
@@ -269,19 +297,19 @@ class SyncEngine:
 
         if is_empty(raw_value):
             self._log_b2c_skip(product_no, "empty_value", raw_value)
-            return ProductProcessResult(product_no, "skip", True, [], 0, 0)
+            return full_product, ProductProcessResult(product_no, "skip", True, [], 0, 0)
 
         try:
             flag = coerce_value(raw_value, "bool", "coerce")
         except ValidationError:
             self._log_b2c_skip(product_no, "invalid_value", raw_value)
-            return ProductProcessResult(product_no, "skip", True, [], 0, 0)
+            return full_product, ProductProcessResult(product_no, "skip", True, [], 0, 0)
 
         if not flag:
             self._log_b2c_skip(product_no, "false_value", raw_value)
-            return ProductProcessResult(product_no, "skip", True, [], 0, 0)
+            return full_product, ProductProcessResult(product_no, "skip", True, [], 0, 0)
 
-        return None
+        return full_product, None
 
     def _log_b2c_skip(self, product_no: str, reason: str, value: Any) -> None:
         self.logger.info(
@@ -294,12 +322,18 @@ class SyncEngine:
             },
         )
 
-    def _handle_update(self, product: Dict[str, Any], product_no: str, dry_run: bool) -> ProductProcessResult:
+    def _handle_update(
+        self,
+        product: Dict[str, Any],
+        product_no: str,
+        dry_run: bool,
+        sync_images: bool = True,
+    ) -> ProductProcessResult:
         errors: List[str] = []
         desired_by_culture, stock_data, categories, dynamic_fields, price_lists = self._build_desired(
             product, product_no, errors
         )
-        images = _extract_images(product)
+        images = _extract_images(product) if sync_images else []
         if errors:
             self.logger.error(
                 "mapping_failed",
@@ -380,7 +414,7 @@ class SyncEngine:
                 },
             )
 
-        if images:
+        if sync_images:
             self.logger.info(
                 "image_sync_plan",
                 extra={
@@ -391,8 +425,10 @@ class SyncEngine:
             )
 
         change_summary = _summarize_changes(diffs, dynamic_diffs, price_lists, images)
+        if sync_images and not images:
+            change_summary["Images"] = ["reload"]
 
-        if not diffs and not dynamic_diffs and not price_lists and not images:
+        if not diffs and not dynamic_diffs and not price_lists and not sync_images:
             return ProductProcessResult(product_no, "no_change", True, [], 0, 0, change_summary)
 
         if dry_run:
@@ -476,11 +512,11 @@ class SyncEngine:
                             },
                         )
 
+            if sync_images:
+                self._sync_images(product_no, images)
+
             if price_lists:
                 self.jetshop_client.price_list_update(price_lists)
-
-            if images:
-                self._sync_images(product_no, images)
 
             return ProductProcessResult(
                 product_no,
@@ -626,7 +662,7 @@ class SyncEngine:
 
     def _sync_images(self, product_no: str, images: List[Dict[str, Any]]) -> None:
         uploaded = 0
-        for image in images:
+        for index, image in enumerate(images, start=1):
             action = (image.get("action") or "").upper()
             if action == "DELETE":
                 self.logger.info(
@@ -639,9 +675,9 @@ class SyncEngine:
                 )
                 continue
             media_code = image.get("mediaCode")
-            file_name = image.get("fileName") or str(media_code)
-            if not media_code or not file_name:
+            if not media_code:
                 continue
+            file_name = _build_jetshop_image_file_name(product_no, image, index)
             base64_code = self.feed_client.fetch_media_base64(str(media_code))
             self.jetshop_client.upload_image(base64_code, file_name, file_name)
             uploaded += 1
@@ -652,23 +688,38 @@ class SyncEngine:
                     "productNo": product_no,
                     "mediaCode": media_code,
                     "fileName": file_name,
+                    "sourceFileName": image.get("fileName"),
+                    "sortNo": image.get("sortNo"),
+                    "sortValue": _image_sort_value(image),
+                    "sortField": image.get("sortField"),
                 },
             )
-        if uploaded:
-            self.jetshop_client.product_add_update_images([product_no])
-            self.logger.info(
-                "image_linked",
-                extra={
-                    "event": "image_linked",
-                    "productNo": product_no,
-                    "uploadedCount": uploaded,
-                },
+        link_results = self.jetshop_client.product_add_update_images([product_no], divider="_")
+        failures = [result for result in link_results if not result.success]
+        if failures:
+            detail = ", ".join(
+                [f"{result.identifier}:{result.result_type}" for result in failures]
             )
+            raise RuntimeError(f"Product_AddUpdateImages failed: {detail}")
+        self.logger.info(
+            "image_linked",
+            extra={
+                "event": "image_linked",
+                "productNo": product_no,
+                "uploadedCount": uploaded,
+                "divider": "_",
+                "resultTypes": [result.result_type for result in link_results],
+            },
+        )
 
 
 def _get_product_no(product: Dict[str, Any]) -> Optional[str]:
     identifier = product.get("identifier") or {}
     return identifier.get("productNo")
+
+
+def _has_image_changes(product: Dict[str, Any]) -> bool:
+    return any((media.get("mediaType") == "IMAGE") for media in product.get("media", []) or [])
 
 
 def _is_feed_deleted(product: Dict[str, Any]) -> bool:
@@ -702,6 +753,8 @@ def _apply_mapping_entry(
     value = raw_value
 
     if _attribute_value_removed(source, attribute):
+        if entry.preserve_if_missing:
+            return None
         empty_value = _empty_value_for_type(entry.type, allow_nil=allow_nil)
         if empty_value is not None:
             return empty_value
@@ -781,6 +834,9 @@ def _apply_dynamic_mapping(
             return None
         errors.append(f"{entry.key}: missing required value")
         return None
+
+    if entry.type == "string" and isinstance(value, bool):
+        value = "true" if value else "false"
 
     value = _coerce_with_policy(value, entry.type, entry.coerce, entry.item_type, entry.key, logger, errors)
 
@@ -865,22 +921,83 @@ def _empty_value_for_type(expected_type: str, allow_nil: bool) -> Any:
 
 def _extract_images(product: Dict[str, Any]) -> List[Dict[str, Any]]:
     media_items = []
-    for media in product.get("media", []) or []:
+    for index, media in enumerate(product.get("media", []) or []):
         if media.get("mediaType") != "IMAGE":
             continue
         media_code = media.get("mediaCode")
         if not media_code:
             continue
         file_name = media.get("fileName") or str(media_code)
+        sort_value, sort_field = _feed_media_sort_value(media)
         media_items.append(
             {
                 "mediaCode": str(media_code),
                 "fileName": file_name,
                 "action": media.get("action"),
                 "sortNo": media.get("sortNo"),
+                "sorting": media.get("sorting"),
+                "sortValue": sort_value,
+                "sortField": sort_field,
+                "sourceIndex": index,
             }
         )
-    return sorted(media_items, key=lambda item: item.get("sortNo") or 0)
+    return sorted(media_items, key=_image_sort_key)
+
+
+def _image_sort_key(image: Dict[str, Any]) -> Tuple[int, Any, int]:
+    sort_no = _numeric_sort_value(_image_sort_value(image))
+    if sort_no is None:
+        return (1, 0, int(image.get("sourceIndex") or 0))
+    if isinstance(sort_no, str):
+        return (0, (1, sort_no), int(image.get("sourceIndex") or 0))
+    return (0, (0, sort_no), int(image.get("sourceIndex") or 0))
+
+
+def _numeric_sort_value(value: Any) -> Optional[Any]:
+    if value is None or value == "":
+        return None
+    try:
+        number = Decimal(str(value))
+    except Exception:
+        return str(value)
+    if number == number.to_integral_value():
+        return int(number)
+    return number
+
+
+def _feed_media_sort_value(media: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
+    for key in ("sorting", "sortNo", "sort"):
+        value = media.get(key)
+        if not is_empty(value):
+            return value, key
+    return None, None
+
+
+def _image_sort_value(image: Dict[str, Any]) -> Optional[Any]:
+    for key in ("sortValue", "sorting", "sortNo", "sort"):
+        value = image.get(key)
+        if not is_empty(value):
+            return value
+    return None
+
+
+def _build_jetshop_image_file_name(
+    product_no: str,
+    image: Dict[str, Any],
+    fallback_sort: int,
+) -> str:
+    source_name = str(image.get("fileName") or image.get("mediaCode") or "")
+    source_name = source_name.split("?", 1)[0]
+    extension = Path(source_name).suffix or ".jpg"
+    sort_code = _image_sort_code(_image_sort_value(image), fallback_sort)
+    return f"{product_no}_{sort_code}{extension.lower()}"
+
+
+def _image_sort_code(value: Any, fallback_sort: int) -> str:
+    sort_value = _numeric_sort_value(value)
+    if sort_value is None:
+        return str(fallback_sort)
+    return str(sort_value).strip()
 
 
 def _build_price_list_items(
