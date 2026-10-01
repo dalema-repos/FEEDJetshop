@@ -4,8 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
+
+
+NUMERIC_DYNAMIC_FIELDS = frozenset(
+    {
+        "atr_height",
+        "atr_dia",
+        "size",
+        "atr_length",
+        "atr_kdiao",
+        "atr_kdian",
+        "atr_kheight",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -29,6 +42,44 @@ def _normalize(value: Any) -> Any:
     if isinstance(value, date):
         return value.isoformat()
     return value
+
+
+def canonical_numeric_string(value: Any) -> Any:
+    """Format numeric dynamic-field values without insignificant trailing zeros."""
+    if isinstance(value, bool) or value is None:
+        return value
+    if not isinstance(value, (str, int, float, Decimal)):
+        return value
+    try:
+        number = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return value
+    if not number.is_finite():
+        return value
+    formatted = format(number, "f")
+    if "." in formatted:
+        formatted = formatted.rstrip("0").rstrip(".")
+    return "0" if formatted in {"", "-0", "+0"} else formatted
+
+
+def _normalize_dynamic_value(key: str, value: Any) -> Any:
+    # Jetshop returns an empty dynamic-field <Value> as None, while an empty
+    # string is written as <Value></Value>. Compare these representations as
+    # the same missing value to avoid sending the same empty update every run.
+    if isinstance(value, str) and value == "":
+        return None
+
+    numeric_value = isinstance(value, (str, int, float, Decimal)) and not isinstance(
+        value, bool
+    )
+    if key in NUMERIC_DYNAMIC_FIELDS and numeric_value:
+        try:
+            number = Decimal(str(value).strip())
+            if number.is_finite():
+                return number
+        except (InvalidOperation, ValueError, TypeError):
+            pass
+    return _normalize(value)
 
 
 def diff_product_data(
@@ -100,7 +151,9 @@ def diff_dynamic_fields(
     for key, cultures in desired.items():
         for culture, desired_value in cultures.items():
             current_value = current.get(key, {}).get(culture)
-            if _normalize(current_value) != _normalize(desired_value):
+            if _normalize_dynamic_value(
+                key, current_value
+            ) != _normalize_dynamic_value(key, desired_value):
                 diffs.append(
                     DiffItem(
                         target_field=key,

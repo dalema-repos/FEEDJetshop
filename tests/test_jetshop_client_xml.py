@@ -100,11 +100,10 @@ def test_build_price_list_item_xml_nil():
         {
             "ArticleNumber": "Pelle-1092-10",
             "PriceListId": "guid-1",
-            "PriceIncVat": 135,
-            "DiscountedPriceIncVat": -1,
+            "DiscountedPriceIncVat": NIL_VALUE,
         }
     )
-    assert "<DiscountedPriceIncVat>-1</DiscountedPriceIncVat>" in xml
+    assert '<DiscountedPriceIncVat xsi:nil="true" />' in xml
 
 
 def test_build_envelope_includes_header():
@@ -174,11 +173,55 @@ def test_product_get_builds_product_options(monkeypatch):
 
     monkeypatch.setattr(client, "_post_soap", fake_post)
 
-    client.product_get("sv-SE", "Pelle-1092-10")
+    client.product_get("sv-SE", "Pelle-1092-10", price_list_id="guid-1")
 
     assert "<productOptions>" in captured["body"]
     assert "<ArticleNumber>Pelle-1092-10</ArticleNumber>" in captured["body"]
     assert "<Culture>sv-SE</Culture>" in captured["body"]
+    assert "<PriceListIdOrName>guid-1</PriceListIdOrName>" in captured["body"]
+
+
+def test_dyn_get_keeps_dynamic_values_scoped_by_article_number(monkeypatch):
+    config = Config(
+        feed_token_url="https://example.invalid/token",
+        feed_client_id="client",
+        feed_client_secret="secret",
+        feed_export_url="https://example.invalid/export",
+        jetshop_soap_url="https://example.invalid/soap",
+        jetshop_username="user",
+        jetshop_password="pass",
+        jetshop_shop_id="1",
+        jetshop_soap_header_xml=None,
+        jetshop_template_id="1",
+        cultures=["sv-SE", "nb-NO"],
+        log_file="logs/test.log",
+        mapping_file="mappings/mapping.yaml",
+        log_level="INFO",
+        http_timeout=5,
+        retry_count=1,
+        retry_backoff=0.1,
+    )
+    client = JetshopClient(config, logging.getLogger("test_dyn_get_article_scope"))
+
+    def fake_post(_body_xml, _operation):
+        return (
+            '<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope">'
+            '<soap:Body><Response xmlns="WebServiceProvider">'
+            '<DynamicFieldOnProductOutput><ArticleNumber>A-1</ArticleNumber>'
+            '<Key>atr_height</Key><ItemValues><Localization><Culture>sv-SE</Culture>'
+            '<Value>63</Value></Localization></ItemValues></DynamicFieldOnProductOutput>'
+            '<DynamicFieldOnProductOutput><ArticleNumber>A-2</ArticleNumber>'
+            '<Key>atr_height</Key><ItemValues><Localization><Culture>sv-SE</Culture>'
+            '<Value>55</Value></Localization></ItemValues></DynamicFieldOnProductOutput>'
+            '</Response></soap:Body></soap:Envelope>'
+        )
+
+    monkeypatch.setattr(client, "_post_soap", fake_post)
+
+    result = client.dyn_get(["A-1", "A-2"], ["sv-SE"])
+
+    assert result["A-1"]["atr_height"]["sv-SE"] == "63"
+    assert result["A-2"]["atr_height"]["sv-SE"] == "55"
 
 
 def test_price_list_update_builds_body(monkeypatch):

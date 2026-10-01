@@ -43,6 +43,15 @@ def main() -> int:
 
     run_id = str(uuid.uuid4())
     logger = setup_logging(config.log_file, config.log_level, run_id)
+
+    logger.info("---Starter---")
+    try:
+        return _run_command(args, config, mapping_path, logger)
+    finally:
+        logger.info("---Ferdig---")
+
+
+def _run_command(args, config, mapping_path: str, logger) -> int:
     state_store = StateStore(Path("state/last_run.json"))
 
     try:

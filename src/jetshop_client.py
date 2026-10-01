@@ -65,12 +65,23 @@ class JetshopClient:
         self.header_xml = _build_header_xml(config)
         self.template_id = config.jetshop_template_id
 
-    def product_get(self, culture: str, article_number: str) -> Optional[Dict[str, Any]]:
+    def product_get(
+        self,
+        culture: str,
+        article_number: str,
+        price_list_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        price_list_xml = (
+            f"<PriceListIdOrName>{escape_xml(price_list_id)}</PriceListIdOrName>"
+            if price_list_id
+            else ""
+        )
         body = f"""
 <Product_Get xmlns="{WS_NS}">
   <productOptions>
     <ArticleNumber>{escape_xml(article_number)}</ArticleNumber>
     <Culture>{escape_xml(culture)}</Culture>
+    {price_list_xml}
   </productOptions>
 </Product_Get>
 """.strip()
@@ -88,6 +99,12 @@ class JetshopClient:
             "ShortDescription": _text_any_ns(product_data, "ShortDescription"),
             "ProductDescription": _text_any_ns(product_data, "ProductDescription"),
             "Price": _text_any_ns(product_data, "Price"),
+            "DiscountedPrice": _text_any_ns(product_data, "DiscountedPrice"),
+            "DiscountStartDate": _text_any_ns(product_data, "DiscountStartDate"),
+            "DiscountEndDate": _text_any_ns(product_data, "DiscountEndDate"),
+            "PriceListIdOrName": _text_any_ns(product_data, "PriceListIdOrName"),
+            "HideProduct": _text_any_ns(product_data, "HideProduct"),
+            "HidePrice": _text_any_ns(product_data, "HidePrice"),
             "EanCode": _text_any_ns(product_data, "EanCode"),
             "ProductInCategories": _parse_categories(product_data),
             "StockData": _parse_stock(product_data),
@@ -151,7 +168,9 @@ class JetshopClient:
                 extra={"event": "jetshop_delete_not_found", "productNo": article_number},
             )
 
-    def dyn_get(self, article_numbers: List[str], cultures: List[str]) -> Dict[str, Dict[str, Any]]:
+    def dyn_get(
+        self, article_numbers: List[str], cultures: List[str]
+    ) -> Dict[str, Dict[str, Dict[str, Any]]]:
         articles_xml = "\n".join([f"<string>{escape_xml(num)}</string>" for num in article_numbers])
         cultures_xml = "\n".join([f"<string>{escape_xml(culture)}</string>" for culture in cultures])
         body = f"""
@@ -166,12 +185,13 @@ class JetshopClient:
 """.strip()
         response_xml = self._post_soap(body, "ProductDynamicField_GetProductDynamicFieldData")
         root = ET.fromstring(response_xml)
-        result: Dict[str, Dict[str, Any]] = {}
+        result: Dict[str, Dict[str, Dict[str, Any]]] = {}
         for item in root.findall(".//ws:DynamicFieldOnProductOutput", NS):
+            article_number = _text(item, "ArticleNumber")
             key = _text(item, "Key")
-            if not key:
+            if not article_number or not key:
                 continue
-            values = result.setdefault(key, {})
+            values = result.setdefault(article_number, {}).setdefault(key, {})
             for loc in item.findall(".//ws:Localization", NS):
                 culture = _text(loc, "Culture")
                 value = _text(loc, "Value")

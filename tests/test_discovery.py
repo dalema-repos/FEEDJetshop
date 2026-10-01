@@ -14,7 +14,7 @@ class StubFeedClient:
 
 class StubJetshopClient:
     def dyn_get(self, article_numbers, cultures):
-        return {"new_dyn_field": {"sv-SE": "value"}}
+        return {article_numbers[0]: {"new_dyn_field": {"sv-SE": "value"}}}
 
 
 def test_discover_mapping(tmp_path):

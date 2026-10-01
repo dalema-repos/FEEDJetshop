@@ -86,7 +86,9 @@ def discover_mapping(
 
     product_no_value = product_no or (product.get("identifier") or {}).get("productNo")
     if product_no_value:
-        dynamic_fields = jetshop_client.dyn_get([product_no_value], mapping.cultures)
+        dynamic_fields = jetshop_client.dyn_get(
+            [product_no_value], mapping.cultures
+        ).get(product_no_value, {})
         for key, values in dynamic_fields.items():
             if key in mapped_dynamic:
                 continue

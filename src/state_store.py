@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Optional
 
 
@@ -22,7 +24,29 @@ class StateStore:
     def write_last_run(self, iso_timestamp: str) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"last_run": iso_timestamp}
-        self.path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        content = json.dumps(payload, ensure_ascii=True, indent=2)
+        temp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="\n",
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temp_file:
+                temp_path = Path(temp_file.name)
+                temp_file.write(content)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+
+            # Replace in one filesystem operation so a partial write cannot
+            # leave last_run.json empty or malformed if the process is stopped.
+            os.replace(temp_path, self.path)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
     def write_now(self) -> str:
         now = datetime.now(timezone.utc).isoformat()

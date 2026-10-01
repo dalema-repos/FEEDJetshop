@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-from .diff_engine import diff_categories, diff_dynamic_fields, diff_product_data, diff_stock
+from .diff_engine import (
+    NUMERIC_DYNAMIC_FIELDS,
+    canonical_numeric_string,
+    diff_categories,
+    diff_dynamic_fields,
+    diff_product_data,
+    diff_stock,
+)
 from .jetshop_client import NIL_VALUE
 from .mapping_loader import (
     AutoDynamicFieldConfig,
@@ -345,14 +352,15 @@ class SyncEngine:
             current_by_culture = {}
             for culture in self.mapping.cultures:
                 current_by_culture[culture] = self.jetshop_client.product_get(culture, product_no) or {}
+            current_dynamic = self.jetshop_client.dyn_get(
+                [product_no], self.mapping.cultures
+            ).get(product_no, {})
         except Exception as exc:
             self.logger.error(
                 "jetshop_read_failed",
                 extra={"event": "jetshop_read_failed", "productNo": product_no, "success": False, "detail": str(exc)},
             )
             return ProductProcessResult(product_no, "read_failed", False, [str(exc)], 0, 0)
-
-        current_dynamic: Dict[str, Dict[str, Any]] = {}
 
         diffs = []
         for culture in self.mapping.cultures:
@@ -389,6 +397,7 @@ class SyncEngine:
 
         dynamic_diffs = diff_dynamic_fields(current_dynamic, dynamic_fields)
         for price_item in price_lists:
+            discounted_price = price_item.get("DiscountedPriceIncVat")
             self.logger.info(
                 "price_list_sync",
                 extra={
@@ -396,7 +405,12 @@ class SyncEngine:
                     "productNo": product_no,
                     "priceListId": price_item.get("PriceListId"),
                     "priceIncVat": price_item.get("PriceIncVat"),
-                    "discountedPriceIncVat": price_item.get("DiscountedPriceIncVat"),
+                    "discountedPriceIncVat": None if discounted_price is NIL_VALUE else discounted_price,
+                    "discountCleared": discounted_price is NIL_VALUE
+                    or (
+                        price_item.get("UseDiscountDateSpan") is False
+                        and discounted_price == price_item.get("PriceIncVat")
+                    ),
                 },
             )
 
@@ -512,11 +526,11 @@ class SyncEngine:
                             },
                         )
 
-            if sync_images:
-                self._sync_images(product_no, images)
-
             if price_lists:
                 self.jetshop_client.price_list_update(price_lists)
+
+            if sync_images:
+                self._sync_images(product_no, images)
 
             return ProductProcessResult(
                 product_no,
@@ -631,6 +645,13 @@ class SyncEngine:
                 errors,
             )
 
+        # FEED may serialize integral measurements as e.g. "63.0" while
+        # Jetshop stores the same value as "63". Keep numeric fields in the
+        # compact Jetshop-style form in any future write payload as well.
+        for key in NUMERIC_DYNAMIC_FIELDS:
+            for culture, value in (dynamic_fields.get(key) or {}).items():
+                dynamic_fields[key][culture] = canonical_numeric_string(value)
+
         price_lists = _build_price_list_items(
             self.mapping,
             product_no,
@@ -662,6 +683,7 @@ class SyncEngine:
 
     def _sync_images(self, product_no: str, images: List[Dict[str, Any]]) -> None:
         uploaded = 0
+        image_failures: List[str] = []
         for index, image in enumerate(images, start=1):
             action = (image.get("action") or "").upper()
             if action == "DELETE":
@@ -678,29 +700,43 @@ class SyncEngine:
             if not media_code:
                 continue
             file_name = _build_jetshop_image_file_name(product_no, image, index)
-            base64_code = self.feed_client.fetch_media_base64(str(media_code))
-            self.jetshop_client.upload_image(base64_code, file_name, file_name)
-            uploaded += 1
-            self.logger.info(
-                "image_uploaded",
-                extra={
-                    "event": "image_uploaded",
-                    "productNo": product_no,
-                    "mediaCode": media_code,
-                    "fileName": file_name,
-                    "sourceFileName": image.get("fileName"),
-                    "sortNo": image.get("sortNo"),
-                    "sortValue": _image_sort_value(image),
-                    "sortField": image.get("sortField"),
-                },
-            )
+            try:
+                base64_code = self.feed_client.fetch_media_base64(str(media_code))
+                self.jetshop_client.upload_image(base64_code, file_name, file_name)
+                uploaded += 1
+                self.logger.info(
+                    "image_uploaded",
+                    extra={
+                        "event": "image_uploaded",
+                        "productNo": product_no,
+                        "mediaCode": media_code,
+                        "fileName": file_name,
+                        "sourceFileName": image.get("fileName"),
+                        "sortNo": image.get("sortNo"),
+                        "sortValue": _image_sort_value(image),
+                        "sortField": image.get("sortField"),
+                    },
+                )
+            except Exception as exc:
+                detail = f"mediaCode={media_code} fileName={file_name}: {exc}"
+                image_failures.append(detail)
+                self.logger.error(
+                    "image_upload_failed",
+                    extra={
+                        "event": "image_upload_failed",
+                        "productNo": product_no,
+                        "mediaCode": media_code,
+                        "fileName": file_name,
+                        "detail": str(exc),
+                    },
+                )
         link_results = self.jetshop_client.product_add_update_images([product_no], divider="_")
-        failures = [result for result in link_results if not result.success]
-        if failures:
+        link_failures = [result for result in link_results if not result.success]
+        if link_failures:
             detail = ", ".join(
-                [f"{result.identifier}:{result.result_type}" for result in failures]
+                [f"{result.identifier}:{result.result_type}" for result in link_failures]
             )
-            raise RuntimeError(f"Product_AddUpdateImages failed: {detail}")
+            image_failures.append(f"Product_AddUpdateImages failed: {detail}")
         self.logger.info(
             "image_linked",
             extra={
@@ -711,6 +747,8 @@ class SyncEngine:
                 "resultTypes": [result.result_type for result in link_results],
             },
         )
+        if image_failures:
+            raise RuntimeError("Image sync incomplete: " + "; ".join(image_failures))
 
 
 def _get_product_no(product: Dict[str, Any]) -> Optional[str]:
@@ -1099,35 +1137,40 @@ def _build_price_list_items(
 
         discount_cleared = False
         if entry.discounted_price_source:
-            if discount_attribute is not None:
-                disc_value = (
-                    discount_raw.get("value")
-                    if isinstance(discount_raw, dict)
-                    else discount_raw
-                )
-                empty_discount = is_empty(disc_value)
-                if entry.clear_discount_on_missing and not empty_discount:
-                    if isinstance(disc_value, (int, float)) and disc_value == 0:
-                        empty_discount = True
-                    elif isinstance(disc_value, str) and disc_value.strip() in {"0", "0.0", "0.00"}:
-                        empty_discount = True
+            disc_value = (
+                discount_raw.get("value")
+                if isinstance(discount_raw, dict)
+                else discount_raw
+            )
+            empty_discount = is_empty(disc_value)
+            if entry.clear_discount_on_missing and not empty_discount:
+                if isinstance(disc_value, (int, float)) and disc_value == 0:
+                    empty_discount = True
+                elif isinstance(disc_value, str) and disc_value.strip() in {"0", "0.0", "0.00"}:
+                    empty_discount = True
 
-                if empty_discount:
-                    if entry.clear_discount_on_missing:
-                        item["DiscountedPriceIncVat"] = -1
-                        discount_cleared = True
-                else:
-                    discount_value = _coerce_with_policy(
-                        disc_value,
-                        entry.type,
-                        entry.coerce,
-                        None,
-                        f"{entry.name or entry.price_list_id}_discount",
-                        logger,
-                        errors,
+            if empty_discount:
+                if entry.clear_discount_on_missing:
+                    # Jetshop converts the -1 sentinel to a negative net value,
+                    # and an xsi:nil update leaves an existing discount intact.
+                    # Use the regular price as a neutral discount and disable
+                    # the date span so no negative or active discount remains.
+                    item["DiscountedPriceIncVat"] = (
+                        price_value if price_value is not None and price_value >= 0 else NIL_VALUE
                     )
-                    if discount_value is not None:
-                        item["DiscountedPriceIncVat"] = discount_value
+                    discount_cleared = True
+            else:
+                discount_value = _coerce_with_policy(
+                    disc_value,
+                    entry.type,
+                    entry.coerce,
+                    None,
+                    f"{entry.name or entry.price_list_id}_discount",
+                    logger,
+                    errors,
+                )
+                if discount_value is not None:
+                    item["DiscountedPriceIncVat"] = discount_value
 
         if entry.discount_period_source:
             if period_attribute is not None:

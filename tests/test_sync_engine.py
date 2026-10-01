@@ -223,9 +223,6 @@ def test_sync_engine_clears_discount_on_missing(tmp_path, monkeypatch):
     mapping = load_mapping(mapping_path)
 
     product = build_sample_product()
-    product["attributes"].append({"importCode": "b2c_disc_price_mp_se", "dataType": "FLOAT"})
-    product["attributes"].append({"importCode": "b2c_disc_price_mp_no", "dataType": "FLOAT"})
-    product["attributes"].append({"importCode": "b2c_disc_price_mp_b2b", "dataType": "FLOAT"})
 
     feed_client = StubFeedClient([product])
     jetshop_client = StubJetshopClient()
@@ -241,7 +238,8 @@ def test_sync_engine_clears_discount_on_missing(tmp_path, monkeypatch):
     assert report["counts"]["failed"] == 0
     assert jetshop_client.price_list_inputs
     for item in jetshop_client.price_list_inputs:
-        assert item.get("DiscountedPriceIncVat") == -1
+        assert item.get("DiscountedPriceIncVat") == item.get("PriceIncVat")
+        assert item.get("UseDiscountDateSpan") is False
         assert item.get("HideProduct") is False
 
 
@@ -274,7 +272,7 @@ def test_sync_engine_clears_discount_on_zero(tmp_path, monkeypatch):
     assert report["counts"]["failed"] == 0
     assert jetshop_client.price_list_inputs
     for item in jetshop_client.price_list_inputs:
-        assert item.get("DiscountedPriceIncVat") == -1
+        assert item.get("DiscountedPriceIncVat") == item.get("PriceIncVat")
 
 
 def test_sync_engine_clears_price_on_missing_value(tmp_path, monkeypatch):
@@ -573,7 +571,7 @@ def test_sync_engine_uses_full_product_for_single_item_mapping_and_images(tmp_pa
     ]
 
 
-def test_sync_engine_syncs_images_before_price_list_failure(tmp_path, monkeypatch):
+def test_sync_engine_stops_image_sync_when_price_list_update_fails(tmp_path, monkeypatch):
     mapping_path = Path(__file__).resolve().parents[1] / "mappings" / "mapping.yaml"
     mapping = load_mapping(mapping_path)
 
@@ -600,9 +598,9 @@ def test_sync_engine_syncs_images_before_price_list_failure(tmp_path, monkeypatc
     report = engine.sync("2025-01-01T00:00:00Z", "Pelle-1092-10", None, False)
 
     assert report["counts"]["failed"] == 1
-    assert jetshop_client.image_uploads[0][1] == "Pelle-1092-10_3.jpg"
-    assert jetshop_client.image_link_calls == 1
-    assert jetshop_client.operation_order.index("image_link") < jetshop_client.operation_order.index("price_list_update")
+    assert jetshop_client.image_uploads == []
+    assert jetshop_client.image_link_calls == 0
+    assert jetshop_client.operation_order[-1] == "price_list_update"
 
 
 def test_sync_engine_single_item_falls_back_to_full_product_when_no_changes(tmp_path, monkeypatch):

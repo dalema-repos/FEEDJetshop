@@ -29,6 +29,16 @@ def request_with_retry(
         try:
             response = session.request(method, url, timeout=timeout, **kwargs)
             if response.status_code in retryable and attempt < retries:
+                logger.warning(
+                    "http_retry_status",
+                    extra={
+                        "event": "http_retry_status",
+                        "statusCode": response.status_code,
+                        "attempt": attempt + 1,
+                        "maxAttempts": retries + 1,
+                        "url": url,
+                    },
+                )
                 _sleep(backoff, attempt)
                 attempt += 1
                 continue

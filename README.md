@@ -15,7 +15,7 @@ Create a `.env` in the project root (values from the spec):
 ```
 FEED_TOKEN_URL=https://mrplant-feed.isysnet.no/token-server/oauth/token
 FEED_CLIENT_ID=feedMrPlant
-FEED_CLIENT_SECRET=cs7U7Gk6LCMFQuZjD2YzJ5WV93XdRgpK
+FEED_CLIENT_SECRET=
 FEED_EXPORT_URL=https://mrplant-feed.isysnet.no/export/export/full
 
 JETSHOP_SOAP_URL=https://integration.jetshop.se/Webservice20/v3.0/webservice.asmx

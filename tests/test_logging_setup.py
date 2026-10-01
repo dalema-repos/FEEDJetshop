@@ -1,8 +1,16 @@
 import json
 import logging
+import threading
 from datetime import datetime, timezone
 
-from src.logging_setup import JsonFormatter, MergeExtraAdapter, TruncatingFileHandler
+from src.logging_setup import (
+    DashboardBatchHandler,
+    JsonFormatter,
+    LoggerConfig,
+    MergeExtraAdapter,
+    TruncatingFileHandler,
+    setup_logger,
+)
 
 
 def test_json_formatter_includes_extras():
@@ -66,3 +74,62 @@ def test_truncating_file_handler_limits_size(tmp_path):
 
     handler.flush()
     assert log_path.stat().st_size <= 400
+
+
+def test_dashboard_batch_handler_posts_in_background_with_api_key(monkeypatch):
+    sent = {}
+    completed = threading.Event()
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+    def fake_post(endpoint, *, json, headers, timeout):
+        sent.update(endpoint=endpoint, batch=json, headers=headers, timeout=timeout)
+        completed.set()
+        return Response()
+
+    monkeypatch.setenv("TEST_DASHBOARD_API_KEY", "test-api-key")
+    monkeypatch.setattr("src.logging_setup.requests.post", fake_post)
+    handler = DashboardBatchHandler(
+        "https://example.test/log-receiver",
+        "test-integration",
+        run_id="run-123",
+        batch_size=2,
+        flush_interval=30,
+        api_key_env="TEST_DASHBOARD_API_KEY",
+        request_timeout=3,
+    )
+    handler.emit(logging.LogRecord("test", logging.INFO, __file__, 10, "first", (), None))
+    handler.emit(logging.LogRecord("test", logging.WARNING, __file__, 11, "second", (), None))
+
+    assert completed.wait(2)
+    handler.close()
+
+    assert sent["endpoint"] == "https://example.test/log-receiver"
+    assert sent["headers"] == {"x-api-key": "test-api-key"}
+    assert sent["timeout"] == 3
+    assert [entry["message"] for entry in sent["batch"]] == ["first", "second"]
+    assert all(entry["integration_name"] == "test-integration" for entry in sent["batch"])
+    assert all(entry["run_id"] == "run-123" for entry in sent["batch"])
+
+
+def test_setup_logger_does_not_add_duplicate_handlers(tmp_path):
+    logger_name = "test_setup_logger_idempotent"
+    config = LoggerConfig(
+        logger_name=logger_name,
+        log_file=str(tmp_path / "idempotent.log"),
+        integration_name=None,
+        console=False,
+    )
+
+    logger = setup_logger(config)
+    initial_handler_count = len(logger.handlers)
+    again = setup_logger(config)
+
+    assert again is logger
+    assert initial_handler_count == 1
+    assert len(logger.handlers) == initial_handler_count
+    for handler in logger.handlers:
+        handler.close()
+    logger.handlers.clear()
